@@ -1,0 +1,4 @@
+nul
+*.tmp
+__pycache__/
+venv/
