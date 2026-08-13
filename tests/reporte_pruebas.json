@@ -1,0 +1,68 @@
+{
+  "resumen": {
+    "OK": 9,
+    "RIESGO": 1
+  },
+  "hallazgos": [
+    {
+      "escenario": "S1",
+      "descripcion": "3 docentes, 1 asignatura (mismo módulo), evaluados por estudiantes",
+      "veredicto": "OK",
+      "detalle": "3 docentes en 1 asignatura: todo correcto."
+    },
+    {
+      "escenario": "S2",
+      "descripcion": "3 docentes evaluados por estudiantes Y por Equipo de la Carrera (mismo módulo)",
+      "veredicto": "OK",
+      "detalle": "Docente con doble evaluador por módulo: 6 barras correctas."
+    },
+    {
+      "escenario": "S3",
+      "descripcion": "3 facilitadores, 1 asignatura (mismo módulo), evaluados por supervisor",
+      "veredicto": "OK",
+      "detalle": "3 facilitadores en 1 asignatura: todo correcto."
+    },
+    {
+      "escenario": "S4",
+      "descripcion": "1 asignatura (tipo Asignatura) evaluada por 3 docentes",
+      "veredicto": "OK",
+      "detalle": "Asignatura evaluada por 3 docentes: 3 barras correctas."
+    },
+    {
+      "escenario": "S5",
+      "descripcion": "Mismo facilitador con 2 archivos de contenido idéntico (mismo módulo y respuestas)",
+      "veredicto": "OK",
+      "detalle": "Archivo duplicado detectado y omitido con aviso."
+    },
+    {
+      "escenario": "S6",
+      "descripcion": "Mismo nombre de archivo (conflicto.xlsx) subido a 2 personas distintas",
+      "veredicto": "OK",
+      "detalle": "Mismo nombre de archivo en 2 personas: ambos almacenados con aviso."
+    },
+    {
+      "escenario": "S7",
+      "descripcion": "Cuestionario sin números de pregunta y con orden/texto distinto al config",
+      "veredicto": "OK",
+      "detalle": "Cuestionario sin numeración/no coincidente: se advierte al usuario sobre el posible desalineamiento de etiquetas y dimensiones."
+    },
+    {
+      "escenario": "S8",
+      "descripcion": "Cuestionario con 18 preguntas únicas para docente/estudiante (config=17)",
+      "veredicto": "OK",
+      "detalle": "Pregunta extra descartada (config=17) pero con advertencia al usuario."
+    },
+    {
+      "escenario": "S9",
+      "descripcion": "Comentarios abiertos con texto irrelevante (Ningno, Bien, Conforme, nada, 0)",
+      "veredicto": "OK",
+      "detalle": "Filtro de comentarios sin ruido."
+    },
+    {
+      "escenario": "S10",
+      "descripcion": "Módulos casi idénticos: 'FILOSOFÍA 2026', 'Filosofia 2026', 'FILOSOFÍA 2026 (tarde)'",
+      "veredicto": "RIESGO",
+      "detalle": "'FILOSOFÍA 2026' y 'Filosofia 2026' se agrupan (bien), pero 'FILOSOFÍA 2026 (tarde)' se separa. Cualquier diferencia de texto en MODULO (sufijos, paréntesis, grupos) fragmenta el mismo módulo en grupos separados de la Comparación."
+    }
+  ]
+}

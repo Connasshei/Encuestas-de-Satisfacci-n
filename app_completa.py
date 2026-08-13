@@ -7,6 +7,54 @@ from io import BytesIO
 import re
 import unicodedata
 from collections import defaultdict
+import json
+import os
+
+REGISTRY_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "person_registry.json"
+)
+
+
+def load_person_registry():
+    """Carga el registry de personas desde disco."""
+    if os.path.exists(REGISTRY_PATH):
+        with open(REGISTRY_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"docente": [], "facilitador": [], "supervisor": [], "asignatura": []}
+
+
+def save_person_registry(registry):
+    """Guarda el registry de personas a disco."""
+    with open(REGISTRY_PATH, "w", encoding="utf-8") as f:
+        json.dump(registry, f, ensure_ascii=False, indent=2)
+
+
+def _next_card_id():
+    counter = st.session_state.get("_card_counter", 0)
+    st.session_state._card_counter = counter + 1
+    return f"card_{counter}"
+
+
+def add_person_card(type_key, ev_key):
+    """Agrega una tarjeta vacía para una persona nueva."""
+    cards = st.session_state.person_cards.setdefault((type_key, ev_key), [])
+    cards.append(_next_card_id())
+
+
+def remove_person_card(type_key, ev_key, card_id):
+    """Elimina una tarjeta y sus archivos asociados."""
+    cards = st.session_state.person_cards.get((type_key, ev_key), [])
+    if card_id in cards:
+        cards.remove(card_id)
+    store = st.session_state.data.get(type_key, {}).get(ev_key, {})
+    to_delete = [
+        fname
+        for fname, entry in store.items()
+        if entry["meta"].get("_card_id") == card_id
+    ]
+    for fname in to_delete:
+        del store[fname]
+
 
 # ══════════════════════════════════════════════════════════
 # CONFIGURACIÓN GLOBAL
@@ -390,6 +438,82 @@ def safe(val):
         return 0.0
 
 
+def _normalize_text(text):
+    n = unicodedata.normalize("NFKD", text.lower())
+    n = "".join(c for c in n if not unicodedata.combining(c))
+    n = re.sub(r"[^a-z0-9\s]", " ", n)
+    return re.sub(r"\s+", " ", n).strip()
+
+
+_COMMENTS_VACIOS = {
+    "ninguno",
+    "ninguna",
+    "ningun",
+    "ningno",
+    "nada",
+    "0",
+    "ninguna observacion",
+    "ninguna observacion en especial",
+    "ninguna en especial",
+    "ningun comentario",
+    "ningun problema",
+    "sin observaciones",
+    "sin observacion",
+    "sin comentarios",
+    "sin comentario",
+    "sin novedad",
+    "no aplica",
+    "bien",
+    "muy bien",
+    "todo bien",
+    "todos bien",
+    "todo muy bien",
+    "conforme",
+    "conformes",
+    "ok",
+    "okey",
+    "si",
+    "no",
+    "excelente",
+    "perfecto",
+    "bueno",
+    "muy bueno",
+}
+
+
+def _es_comentario_vacio(val):
+    n = _normalize_text(val)
+    if not n:
+        return True
+    palabras = n.split()
+    if len(palabras) == 1 and len(palabras[0]) <= 3:
+        return True
+    return n in _COMMENTS_VACIOS
+
+
+def _tokens_significativos(text):
+    return set(re.findall(r"[a-z0-9]{5,}", _normalize_text(text)))
+
+
+def _buscar_duplicado(store, parsed):
+    """Retorna el nombre de un archivo ya cargado con contenido idéntico."""
+    mod = normalize_mod(parsed["meta"]["modulo"])
+    resp = parsed["meta"]["respuestas"]
+    preg = [(q["num"], q["Sí"], q["A veces"], q["No"]) for q in parsed["questions"]]
+    coms = parsed["comments"]
+    for fname, e in store.items():
+        if e["meta"]["respuestas"] != resp:
+            continue
+        if normalize_mod(e["meta"]["modulo"]) != mod:
+            continue
+        if [(q["num"], q["Sí"], q["A veces"], q["No"]) for q in e["questions"]] != preg:
+            continue
+        if e["comments"] != coms:
+            continue
+        return fname
+    return None
+
+
 def parse_evaluacion(file_bytes, filename, ev_type_key, ev_key, config):
     """Parsea un Excel de evaluacion usando el config del evaluador."""
     wb = openpyxl.load_workbook(BytesIO(file_bytes), read_only=True, data_only=True)
@@ -416,6 +540,9 @@ def parse_evaluacion(file_bytes, filename, ev_type_key, ev_key, config):
 
     dedup = config.get("dedup", False)
     seen_texts = {}
+    max_q = len(config["question_short"])
+    vimos_numero = False
+    extra_preguntas = []
 
     for row in rows:
         first = str(row[0] or "").strip()
@@ -472,9 +599,11 @@ def parse_evaluacion(file_bytes, filename, ev_type_key, ev_key, config):
                     if num_match
                     else (len(seen_texts) + 1 if dedup else len(questions) + 1)
                 )
+                if num_match:
+                    vimos_numero = True
 
-                max_q = len(config["question_short"])
                 if num > max_q:
+                    extra_preguntas.append(pregunta)
                     continue
 
                 q_entry = {
@@ -498,28 +627,7 @@ def parse_evaluacion(file_bytes, filename, ev_type_key, ev_key, config):
         elif in_comments:
             for cell in row[2:]:
                 val = str(cell or "").strip()
-                if val and val.lower() not in (
-                    "ninguno",
-                    "ninguna",
-                    "n/a",
-                    "",
-                    ".",
-                    "-",
-                    "..",
-                    "ninguna observacion",
-                    "ninguna observación",
-                    "sin observaciones",
-                    "sin comentarios",
-                    "sin observacion",
-                    "sin comentario",
-                    "ninguna observacion ",
-                    "ninguna observación ",
-                    "sin observaciones.",
-                    "nada",
-                    "0",
-                    "ningún",
-                    "ningun",
-                ):
+                if val and not _es_comentario_vacio(val):
                     comments.append(val)
 
     if not meta["docente"]:
@@ -551,6 +659,36 @@ def parse_evaluacion(file_bytes, filename, ev_type_key, ev_key, config):
             else 0.0
         )
 
+    advertencias = []
+    if not vimos_numero and questions:
+        total_check = 0
+        aciertos = 0
+        for q in questions:
+            exp = config["question_short"].get(q["num"], "")
+            exp_tokens = _tokens_significativos(exp)
+            if not exp_tokens:
+                continue
+            total_check += 1
+            texto = re.sub(r"^\d+[\.\-]\s*", "", q["pregunta"]).strip()
+            if _tokens_significativos(texto) & exp_tokens:
+                aciertos += 1
+        if total_check and aciertos / total_check < 0.6:
+            advertencias.append(
+                "El archivo no trae numeración de preguntas y su texto no coincide "
+                "con el cuestionario esperado; se asignaron los números por posición, "
+                "así que las etiquetas y dimensiones podrían quedar mal asignadas. "
+                "Verifica el orden de las preguntas."
+            )
+    if extra_preguntas:
+        advertencias.append(
+            f"Se descartaron {len(extra_preguntas)} pregunta(s) que exceden las "
+            f"{max_q} esperadas para este tipo de evaluación: "
+            + "; ".join(extra_preguntas[:3])
+            + (" …" if len(extra_preguntas) > 3 else "")
+        )
+    if advertencias:
+        meta["advertencias"] = advertencias
+
     return {"meta": meta, "questions": questions, "comments": comments}
 
 
@@ -572,7 +710,6 @@ def render_individual(entry):
     meta = entry["meta"]
     qs = entry["questions"]
     comments = entry["comments"]
-
     ev_type_key = meta["tipo_evaluado"]
     ev_key = meta["tipo_evaluador"]
     ev_type_label = EVALUATED_TYPES[ev_type_key]["label"]
@@ -582,7 +719,8 @@ def render_individual(entry):
 
     with st.container(border=True):
         guion = "\u2014"
-        c1, c2, c3, c4 = st.columns(4)
+        persona = meta.get("persona_nombre") or meta.get("docente") or guion
+        c1, c2, c3, c4, c5 = st.columns(5)
         with c1:
             st.markdown("**Módulo**")
             st.markdown(
@@ -590,24 +728,30 @@ def render_individual(entry):
                 unsafe_allow_html=True,
             )
         with c2:
+            st.markdown("**Persona**")
+            st.markdown(
+                f"<div style='word-break:break-word;white-space:normal;line-height:1.4'>{persona}</div>",
+                unsafe_allow_html=True,
+            )
+        with c3:
             st.markdown("**Evaluado**")
             st.markdown(
                 f"<div style='word-break:break-word;white-space:normal;line-height:1.4'>{ev_type_label}</div>",
                 unsafe_allow_html=True,
             )
-        with c3:
+        with c4:
             st.markdown("**Evaluador**")
             st.markdown(
                 f"<div style='word-break:break-word;white-space:normal;line-height:1.4'>{ev_label}</div>",
                 unsafe_allow_html=True,
             )
-        with c4:
+        with c5:
             st.metric("Respuestas", meta["respuestas"])
-        c5, c6, c7 = st.columns(3)
-        c5.caption(f"Inicio: {meta['fecha_inicio']}")
-        c6.caption(f"Fin: {meta['fecha_fin']}")
-        if meta.get("docente"):
-            c7.markdown(f"**Docente:** {meta['docente']}")
+        c6, c7, c8 = st.columns(3)
+        c6.caption(f"Inicio: {meta['fecha_inicio']}")
+        c7.caption(f"Fin: {meta['fecha_fin']}")
+        if meta.get("grupo"):
+            c8.caption(f"Grupo: {meta['grupo']}")
 
     st.divider()
 
@@ -840,8 +984,51 @@ def normalize_mod(name):
     return n
 
 
+def _person_summary_text(
+    nombre, evaluador, score, modulo, respuestas, ev_type_key, modulo_norm
+):
+    """Genera un párrafo descriptivo para una persona evaluada."""
+    dim_scores = {}
+    ev_type = EVALUATED_TYPES.get(ev_type_key, {})
+    for ev_key, ev_cfg in ev_type.get("evaluators", {}).items():
+        store = st.session_state.data.get(ev_type_key, {}).get(ev_key, {})
+        for entry in store.values():
+            if normalize_mod(entry["meta"]["modulo"]) == modulo_norm:
+                if (
+                    entry["meta"].get("persona_nombre") or entry["meta"].get("docente")
+                ) == nombre:
+                    for dim in ev_cfg["dimensions"]:
+                        dim_qs = [
+                            q
+                            for q in entry["questions"]
+                            if dim in q.get("dimensiones", [])
+                        ]
+                        if dim_qs:
+                            dim_avg = round(
+                                sum(q["score"] for q in dim_qs) / len(dim_qs), 2
+                            )
+                            if dim not in dim_scores or dim_avg > dim_scores[dim]:
+                                dim_scores[dim] = dim_avg
+
+    mejor_dim = max(dim_scores, key=dim_scores.get) if dim_scores else None
+    peor_dim = min(dim_scores, key=dim_scores.get) if dim_scores else None
+
+    texto = (
+        f"**{nombre}** ({evaluador}) obtuvo un puntaje promedio de "
+        f'**{score:.2f}/3** en el módulo "{modulo}", con **{respuestas}** respuestas.'
+    )
+    if mejor_dim and peor_dim and mejor_dim != peor_dim:
+        texto += (
+            f" Su dimensión más destacada fue **{mejor_dim}** ({dim_scores[mejor_dim]:.2f}/3), "
+            f"mientras que **{peor_dim}** ({dim_scores[peor_dim]:.2f}/3) presenta un área de oportunidad."
+        )
+    elif mejor_dim:
+        texto += f" La dimensión evaluada fue **{mejor_dim}** ({dim_scores[mejor_dim]:.2f}/3)."
+    return texto
+
+
 def render_comparacion():
-    """Agrupa entradas por (tipo_evaluado, módulo), promedia evaluadores y muestra gráficas del promedio combinado."""
+    """Agrupa entradas por (tipo_evaluado, módulo), muestra barras por persona + promedio."""
 
     groups = defaultdict(list)
     for ev_type_key in EVALUATED_TYPES:
@@ -858,30 +1045,36 @@ def render_comparacion():
 
     combined = []
     for (ev_type_key, _mod_norm), entries in groups.items():
-        entry_avgs = []
+        personas = []
         for e in entries:
+            nombre = e["meta"].get("persona_nombre") or e["meta"].get("docente") or "—"
             qs = e["questions"]
-            entry_avgs.append(sum(q["score"] for q in qs) / len(qs) if qs else 0)
-        combined_avg = round(sum(entry_avgs) / len(entry_avgs), 2)
-        first = entries[0]
-
-        ev_breakdown = {}
-        for e in entries:
-            ek = e["meta"]["tipo_evaluador"]
-            el = EVALUATED_TYPES[ev_type_key]["evaluators"][ek]["label"]
-            qs = e["questions"]
-            ev_breakdown[el] = round(
-                sum(q["score"] for q in qs) / len(qs) if qs else 0, 2
+            avg = sum(q["score"] for q in qs) / len(qs) if qs else 0
+            personas.append(
+                {
+                    "nombre": nombre,
+                    "score": round(avg, 2),
+                    "evaluador": EVALUATED_TYPES[ev_type_key]["evaluators"][
+                        e["meta"]["tipo_evaluador"]
+                    ]["label"],
+                    "respuestas": e["meta"]["respuestas"],
+                }
             )
+
+        total_resp = sum(p["respuestas"] for p in personas)
+        combined_avg = (
+            round(sum(p["score"] * p["respuestas"] for p in personas) / total_resp, 2)
+            if total_resp
+            else 0
+        )
+        first = entries[0]
 
         combined.append(
             {
                 "ev_type_key": ev_type_key,
                 "modulo": first["meta"]["modulo"],
-                "docente": first["meta"]["docente"],
                 "combined_avg": combined_avg,
-                "entries": entries,
-                "ev_breakdown": ev_breakdown,
+                "personas": personas,
                 "respuestas": sum(e["meta"]["respuestas"] for e in entries),
             }
         )
@@ -905,61 +1098,102 @@ def render_comparacion():
     col2.metric("Total Módulos Únicos", len(combined))
     col3.metric(
         "Mejor Módulo",
-        (best_mod["modulo"] or best_mod["docente"])[:25],
+        (best_mod["modulo"] or guion)[:25],
         f"{best_mod['combined_avg']:.2f}",
     )
     col4.metric(
         "Menor Módulo",
-        (worst_mod["modulo"] or worst_mod["docente"])[:25],
+        (worst_mod["modulo"] or guion)[:25],
         f"{worst_mod['combined_avg']:.2f}",
     )
 
     st.divider()
 
     # ───────────────────────────────
-    # Fila 2 — Ranking Combinado
+    # Fila 2 — Ranking por Módulo (barras por persona + promedio global)
     # ───────────────────────────────
-    st.markdown("#### Ranking Combinado por Módulo")
-    rank_rows = []
-    for d in combined:
-        rank_rows.append(
-            {
-                "Módulo": d["modulo"] or d["docente"] or guion,
-                "Tipo": type_labels[d["ev_type_key"]],
-                "Promedio Combinado": d["combined_avg"],
-                **{k: v for k, v in d["ev_breakdown"].items()},
-                "Respuestas": d["respuestas"],
-            }
-        )
-    df_rank = pd.DataFrame(rank_rows).reset_index(drop=True)
-    df_rank.index += 1
+    st.markdown("#### Ranking por Módulo — Barras por Persona + Promedio Global")
+    st.caption(
+        "Compara el puntaje individual de cada persona evaluada por módulo. El rombo negro indica el promedio global del módulo (ponderado por respuestas)."
+    )
 
-    fig_rank = px.bar(
-        df_rank,
-        x="Módulo",
-        y="Promedio Combinado",
-        color="Tipo",
-        color_discrete_map=type_colors,
-        text="Promedio Combinado",
-        height=380,
-    )
-    fig_rank.update_traces(
-        texttemplate="%{text:.2f}",
-        textposition="outside",
-        hovertemplate="%{x}: %{y:.2f}",
-    )
+    # Promedio ponderado global por módulo (combinando todos los tipos)
+    module_global_avg = {}
+    for d in combined:
+        mod = d["modulo"] or guion
+        for p in d["personas"]:
+            if mod not in module_global_avg:
+                module_global_avg[mod] = {"score_sum": 0.0, "resp_sum": 0}
+            module_global_avg[mod]["score_sum"] += p["score"] * p["respuestas"]
+            module_global_avg[mod]["resp_sum"] += p["respuestas"]
+    for mod, v in module_global_avg.items():
+        v["avg"] = round(v["score_sum"] / v["resp_sum"], 2) if v["resp_sum"] else 0
+
+    fig_rank = go.Figure()
+    diamond_added = set()
+
+    for d in combined:
+        mod_label = d["modulo"] or guion
+        personas = d["personas"]
+
+        for i, p in enumerate(personas):
+            color = type_colors.get(type_labels.get(d["ev_type_key"]), "#888888")
+            label = f"{p['nombre']} ({p['evaluador']})"
+            fig_rank.add_trace(
+                go.Bar(
+                    name=label,
+                    x=[mod_label],
+                    y=[p["score"]],
+                    marker_color=color,
+                    text=[f"{p['score']:.2f}"],
+                    textposition="outside",
+                    texttemplate="%{text:.2f}",
+                    hovertemplate=f"{label}<br>{mod_label}: %{{y:.2f}}<extra></extra>",
+                    showlegend=True,
+                    legendgroup=label,
+                )
+            )
+
+        # Un solo rombo por módulo con el promedio global
+        if mod_label not in diamond_added:
+            diamond_added.add(mod_label)
+            global_avg = module_global_avg[mod_label]["avg"]
+            fig_rank.add_trace(
+                go.Scatter(
+                    x=[mod_label],
+                    y=[global_avg],
+                    mode="markers+text",
+                    marker=dict(
+                        symbol="diamond",
+                        size=12,
+                        color="black",
+                    ),
+                    text=[f"Prom: {global_avg:.2f}"],
+                    textposition="top center",
+                    textfont=dict(size=11, color="black"),
+                    hovertemplate=f"Promedio {mod_label}: %{{y:.2f}}<extra></extra>",
+                    showlegend=False,
+                )
+            )
+
     fig_rank.update_layout(
-        yaxis=dict(range=[0, 3.5]),
+        barmode="group",
+        yaxis=dict(range=[0, 3.5], title="Puntaje /3"),
         xaxis_tickangle=-20,
+        height=420,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1,
+            font=dict(size=10),
+        ),
         plot_bgcolor="rgba(0,0,0,0)",
         paper_bgcolor="rgba(0,0,0,0)",
+        margin=dict(b=100),
     )
     st.plotly_chart(fig_rank, use_container_width=True)
-    float_cols = df_rank.select_dtypes(include="float").columns.tolist()
-    st.dataframe(
-        df_rank.style.format({c: "{:.2f}" for c in float_cols}),
-        use_container_width=True,
-    )
 
     st.divider()
 
@@ -967,6 +1201,9 @@ def render_comparacion():
     # Fila 3 — Promedio por Tipo
     # ───────────────────────────────
     st.markdown("#### Promedio Combinado por Tipo Evaluado")
+    st.caption(
+        "Promedio de puntajes agrupado por tipo de evaluación (Docente, Facilitador, Supervisor, Asignatura). Permite comparar el desempeño general entre ámbitos."
+    )
     tipo_rows = []
     for ev_type_key, cfg in EVALUATED_TYPES.items():
         scores = [
@@ -1010,24 +1247,32 @@ def render_comparacion():
     # Fila 4 — Dimensión combinada
     # ───────────────────────────────
     st.markdown("#### Promedio por Dimensión (Combinado)")
+    st.caption(
+        "Distribución de puntajes por dimensión de evaluación, combinando todos los tipos y módulos. Identifica fortalezas y áreas de oportunidad transversales."
+    )
     dim_data = []
     for d in combined:
         ev_type_key = d["ev_type_key"]
-        for e in d["entries"]:
-            ek = e["meta"]["tipo_evaluador"]
-            cfg = EVALUATED_TYPES[ev_type_key]["evaluators"][ek]
-            for dim in cfg["dimensions"]:
-                dim_qs = [q for q in e["questions"] if dim in q.get("dimensiones", [])]
-                if dim_qs:
-                    dim_data.append(
-                        {
-                            "Dimensión": dim,
-                            "Tipo": type_labels[ev_type_key],
-                            "Promedio": round(
-                                sum(q["score"] for q in dim_qs) / len(dim_qs), 2
-                            ),
-                        }
-                    )
+        for ev_store in st.session_state.data.get(ev_type_key, {}).values():
+            for e in ev_store.values():
+                if normalize_mod(e["meta"]["modulo"]) == normalize_mod(d["modulo"]):
+                    ek = e["meta"]["tipo_evaluador"]
+                    cfg = EVALUATED_TYPES[ev_type_key]["evaluators"][ek]
+                    for dim in cfg["dimensions"]:
+                        dim_qs = [
+                            q for q in e["questions"] if dim in q.get("dimensiones", [])
+                        ]
+                        if dim_qs:
+                            dim_data.append(
+                                {
+                                    "Dimensión": dim,
+                                    "Tipo": type_labels[ev_type_key],
+                                    "Promedio": round(
+                                        sum(q["score"] for q in dim_qs) / len(dim_qs),
+                                        2,
+                                    ),
+                                }
+                            )
     if dim_data:
         df_dim = pd.DataFrame(dim_data)
         df_dim_grouped = (
@@ -1063,32 +1308,64 @@ def render_comparacion():
     st.divider()
 
     # ───────────────────────────────
-    # Fila 5 — Desglose por módulo
+    # Fila 5 — Desglose por persona
     # ───────────────────────────────
-    st.markdown("#### Desglose por Módulo")
+    st.markdown("#### Desglose por Persona")
+    st.caption(
+        "Tabla detallada con el puntaje de cada persona, ordenada por tipo y módulo."
+    )
     detail_rows = []
     for d in combined:
-        row = {
-            "Tipo": type_labels[d["ev_type_key"]],
-            "Módulo": d["modulo"] or d["docente"] or guion,
-            "Prom. Combinado": d["combined_avg"],
-        }
-        for el, sc in d["ev_breakdown"].items():
-            row[el] = sc
-        row["Respuestas"] = d["respuestas"]
-        detail_rows.append(row)
-    df_detail = pd.DataFrame(detail_rows).sort_values(
-        ["Tipo", "Prom. Combinado"], ascending=[True, False]
-    )
-    float_cols = df_detail.select_dtypes(include="float").columns.tolist()
-    fmt_dict = {c: "{:.2f}" for c in float_cols}
-    styler = df_detail.style.background_gradient(
-        subset=[c for c in df_detail.columns if c in ("Prom. Combinado",)],
-        cmap="RdYlGn",
-        vmin=1,
-        vmax=3,
-    ).format(fmt_dict)
-    st.dataframe(styler, use_container_width=True, hide_index=True)
+        for p in d["personas"]:
+            detail_rows.append(
+                {
+                    "Tipo": type_labels[d["ev_type_key"]],
+                    "Módulo": d["modulo"] or guion,
+                    "Persona": p["nombre"],
+                    "Evaluador": p["evaluador"],
+                    "Puntaje": p["score"],
+                    "Respuestas": p["respuestas"],
+                }
+            )
+    if detail_rows:
+        df_detail = pd.DataFrame(detail_rows)
+        df_detail = df_detail.sort_values(
+            ["Tipo", "Módulo", "Puntaje"], ascending=[True, True, False]
+        )
+        styler = df_detail.style.background_gradient(
+            subset=["Puntaje"],
+            cmap="RdYlGn",
+            vmin=1,
+            vmax=3,
+        ).format({"Puntaje": "{:.2f}"})
+        st.dataframe(styler, use_container_width=True, hide_index=True)
+
+    # ───────────────────────────────
+    # Fila 6 — Resumen de Resultados
+    # ───────────────────────────────
+    st.divider()
+    st.markdown("#### Resumen de Resultados")
+    st.caption("Descripción detallada del desempeño de cada persona evaluada.")
+
+    seen = set()
+    for d in combined:
+        ev_type_key = d["ev_type_key"]
+        modulo_norm = normalize_mod(d["modulo"])
+        for p in d["personas"]:
+            key = (p["nombre"], d["modulo"], p["evaluador"])
+            if key in seen:
+                continue
+            seen.add(key)
+            texto = _person_summary_text(
+                p["nombre"],
+                p["evaluador"],
+                p["score"],
+                d["modulo"] or "\u2014",
+                p["respuestas"],
+                ev_type_key,
+                modulo_norm,
+            )
+            st.markdown(texto)
 
 
 def render_diagnostico():
@@ -1145,12 +1422,17 @@ def render_diagnostico():
         ev_label = EVALUATED_TYPES[entry["meta"]["tipo_evaluado"]]["evaluators"][
             entry["meta"]["tipo_evaluador"]
         ]["label"]
+        persona = (
+            entry["meta"].get("persona_nombre")
+            or entry["meta"].get("docente")
+            or "\u2014"
+        )
         rank_rows.append(
             {
                 "Módulo": entry["meta"]["modulo"] or entry["meta"]["archivo"],
                 "Evaluado": ev_type_label,
                 "Evaluador": ev_label,
-                "Docente": entry["meta"]["docente"] or "\u2014",
+                "Persona": persona,
                 "Puntaje global": min(3.0, round(avg, 2)),
                 "Respuestas": entry["meta"]["respuestas"],
             }
@@ -1158,11 +1440,17 @@ def render_diagnostico():
 
     if rank_rows:
         df_rank = pd.DataFrame(rank_rows)
+        df_rank["_Modulo_norm"] = df_rank["Módulo"].apply(normalize_mod)
         df_rank_grouped = (
-            df_rank.groupby(
-                ["Módulo", "Evaluado", "Evaluador", "Docente"], as_index=False
+            df_rank.groupby(["_Modulo_norm", "Evaluado", "Evaluador"], as_index=False)
+            .agg(
+                {
+                    "Módulo": "first",
+                    "Puntaje global": "mean",
+                    "Respuestas": "sum",
+                }
             )
-            .agg({"Puntaje global": "mean", "Respuestas": "sum"})
+            .drop(columns="_Modulo_norm")
             .round(2)
             .sort_values("Puntaje global", ascending=False)
             .reset_index(drop=True)
@@ -1261,9 +1549,15 @@ def render_diagnostico():
     debilidades = []
     for entry in filtered:
         ev_type_label = EVALUATED_TYPES[entry["meta"]["tipo_evaluado"]]["label"]
+        persona = (
+            entry["meta"].get("persona_nombre")
+            or entry["meta"].get("docente")
+            or "\u2014"
+        )
         for q in entry["questions"]:
             item = {
                 "Módulo": entry["meta"]["modulo"] or entry["meta"]["archivo"],
+                "Persona": persona,
                 "Evaluado": ev_type_label,
                 "Pregunta": q["short"],
                 "Puntaje": q["score"],
@@ -1306,9 +1600,15 @@ def render_diagnostico():
         scores = [q["score"] for q in entry["questions"]]
         if scores:
             ev_type_label = EVALUATED_TYPES[entry["meta"]["tipo_evaluado"]]["label"]
+            persona = (
+                entry["meta"].get("persona_nombre")
+                or entry["meta"].get("docente")
+                or "\u2014"
+            )
             stats_rows.append(
                 {
                     "Módulo": entry["meta"]["modulo"] or entry["meta"]["archivo"],
+                    "Persona": persona,
                     "Evaluado": ev_type_label,
                     "Media": round(sum(scores) / len(scores), 2),
                     "Mediana": round(pd.Series(scores).median(), 2),
@@ -1329,8 +1629,17 @@ def render_diagnostico():
 
 def label_for(entry):
     m = entry["meta"]
-    base = m["modulo"] if m["modulo"] else m["archivo"]
-    return base[:60]
+    nombre = m.get("persona_nombre") or m.get("docente") or ""
+    modulo = m.get("modulo") or m.get("archivo")
+    if nombre:
+        return f"{nombre} — {modulo}"[:60]
+    return modulo[:60]
+
+
+def persona_label(entry):
+    """Retorna el nombre de la persona para display."""
+    m = entry["meta"]
+    return m.get("persona_nombre") or m.get("docente") or m.get("archivo", "—")
 
 
 # ══════════════════════════════════════════════════════════
@@ -1342,6 +1651,12 @@ if "data" not in st.session_state:
         st.session_state.data[ev_type_key] = {}
         for ev_key in EVALUATED_TYPES[ev_type_key]["evaluators"]:
             st.session_state.data[ev_type_key][ev_key] = {}
+
+if "person_registry" not in st.session_state:
+    st.session_state.person_registry = load_person_registry()
+
+if "person_cards" not in st.session_state:
+    st.session_state.person_cards = {}
 
 # ══════════════════════════════════════════════════════════
 # SIDEBAR
@@ -1374,7 +1689,7 @@ with st.sidebar:
 if page == "Cargar Datos":
     st.title("Carga de Archivos de Encuesta")
     st.markdown(
-        "Selecciona la **persona evaluada** y sube los archivos Excel (.xlsx) exportados desde Moodle."
+        "Selecciona la **persona evaluada**, ingresa su nombre y sube los archivos Excel (.xlsx) exportados desde Moodle."
     )
 
     # Selector de tipo evaluado
@@ -1388,6 +1703,8 @@ if page == "Cargar Datos":
     sel_type_key = ev_type_opts[sel_label]
     sel_config = EVALUATED_TYPES[sel_type_key]
 
+    registry = st.session_state.person_registry
+
     st.markdown(f"**{sel_config['label']}** evaluado por:")
 
     evaluator_list = get_evaluator_pairs(sel_type_key)
@@ -1399,52 +1716,213 @@ if page == "Cargar Datos":
             st.markdown(
                 f"**Evaluación del {ev_cfg['label']} al {sel_config['label']}**"
             )
-            st.caption(
-                "Escala: Sí -> 3, A veces -> 2, No -> 1"
-            )
+            st.caption("Escala: Sí -> 3, A veces -> 2, No -> 1")
 
-            store_key = (sel_type_key, ev_key)
-            uploaded = st.file_uploader(
-                f"Seleccionar archivo(s) de {ev_cfg['label']}:",
-                type=["xlsx"],
-                accept_multiple_files=True,
-                key=f"upload_{sel_type_key}_{ev_key}",
-            )
+            cards_key = (sel_type_key, ev_key)
+            cards = st.session_state.person_cards.get(cards_key, [])
 
-            if uploaded:
-                nuevos = 0
-                for f in uploaded:
-                    if f.name not in st.session_state.data[sel_type_key][ev_key]:
-                        try:
-                            parsed = parse_evaluacion(
-                                f.read(), f.name, sel_type_key, ev_key, ev_cfg
-                            )
-                            st.session_state.data[sel_type_key][ev_key][f.name] = parsed
-                            nuevos += 1
-                        except Exception as e:
-                            st.error(f"Error en **{f.name}**: {e}")
-                if nuevos:
-                    st.success(f"{nuevos} archivo(s) de {ev_cfg['label']} cargado(s).")
+            # ── Renderizar cada tarjeta de persona ──
+            for card_id in list(cards):
+                with st.container(border=True):
+                    persona_nombre = ""
+                    agregar_al_registry = False
 
-            store = st.session_state.data[sel_type_key][ev_key]
-            if store:
-                st.markdown(f"### Archivos de {ev_cfg['label']} cargados")
-                for fname, entry in list(store.items()):
-                    m = entry["meta"]
-                    with st.container(border=True):
-                        col1, col2 = st.columns([8, 1])
-                        with col1:
-                            st.markdown(f"**{m['modulo'] or fname}**")
-                            cols_meta = st.columns(4)
-                            cols_meta[0].caption(m["docente"] or "\u2014")
-                            cols_meta[1].caption(m["carrera"] or "\u2014")
-                            cols_meta[2].caption(m["sede"] or "\u2014")
-                            cols_meta[3].caption(f"{m['respuestas']} respuestas")
-                        if col2.button(
-                            "Borrar", key=f"del_{sel_type_key}_{ev_key}_{fname}"
+                    col_title, col_delete = st.columns([6, 1])
+                    with col_title:
+                        st.markdown(f"#### Persona")
+                    with col_delete:
+                        if st.button(
+                            ":material/delete:",
+                            key=f"del_card_{sel_type_key}_{ev_key}_{card_id}",
+                            help="Eliminar esta persona y sus archivos",
                         ):
-                            del st.session_state.data[sel_type_key][ev_key][fname]
+                            remove_person_card(sel_type_key, ev_key, card_id)
                             st.rerun()
+
+                    # Nombre de persona: selector o input
+                    personas_existentes = registry.get(sel_type_key, [])
+                    persona_opciones = ["[Nueva persona]"] + personas_existentes
+                    persona_elegida = st.selectbox(
+                        "Persona:",
+                        persona_opciones,
+                        key=f"persona_{sel_type_key}_{ev_key}_{card_id}",
+                    )
+
+                    if persona_elegida == "[Nueva persona]":
+                        persona_nombre = st.text_input(
+                            "Nombre completo:",
+                            key=f"nuevo_nombre_{sel_type_key}_{ev_key}_{card_id}",
+                            placeholder="Ej: Lic. Ana Cecilia Ballerstaedt",
+                        )
+                        if persona_nombre:
+                            agregar_al_registry = st.checkbox(
+                                "Guardar en el registry para reusar",
+                                key=f"reg_chk_{sel_type_key}_{ev_key}_{card_id}",
+                            )
+                    else:
+                        persona_nombre = persona_elegida
+
+                    # Subida de archivos
+                    uploaded = st.file_uploader(
+                        f"Seleccionar archivo(s) de {ev_cfg['label']}:",
+                        type=["xlsx"],
+                        accept_multiple_files=True,
+                        key=f"upload_{sel_type_key}_{ev_key}_{card_id}",
+                    )
+
+                    if uploaded and persona_nombre:
+                        nuevos = 0
+                        store = st.session_state.data[sel_type_key][ev_key]
+                        avisos_dup = st.session_state.setdefault(
+                            "_avisos_duplicados", {}
+                        )
+                        avisos_dup.pop(card_id, None)
+                        for f in uploaded:
+                            ya_existe = any(
+                                e["meta"]["archivo"] == f.name
+                                and e["meta"].get("_card_id") == card_id
+                                for e in store.values()
+                            )
+                            if ya_existe:
+                                continue
+                            try:
+                                parsed = parse_evaluacion(
+                                    f.read(), f.name, sel_type_key, ev_key, ev_cfg
+                                )
+                                parsed["meta"]["persona_nombre"] = persona_nombre
+                                parsed["meta"]["docente"] = persona_nombre
+                                parsed["meta"]["_card_id"] = card_id
+                                dup = _buscar_duplicado(store, parsed)
+                                if dup:
+                                    avisos_dup.setdefault(card_id, []).append(
+                                        f"El archivo **{f.name}** parece un duplicado "
+                                        f"de **{dup}** (mismo módulo, número de "
+                                        "respuestas y preguntas); se omitió para no "
+                                        "inflar los resultados."
+                                    )
+                                    continue
+                                key = f.name
+                                if any(
+                                    e["meta"]["archivo"] == f.name
+                                    and e["meta"].get("_card_id") != card_id
+                                    for e in store.values()
+                                ):
+                                    key = f"{card_id}_{f.name}"
+                                    parsed["meta"].setdefault(
+                                        "advertencias", []
+                                    ).append(
+                                        f"El archivo '{f.name}' ya estaba cargado para "
+                                        f"otra persona; se guardó internamente como "
+                                        f"'{key}'. Considera renombrarlo."
+                                    )
+                                store[key] = parsed
+                                nuevos += 1
+                            except Exception as e:
+                                st.error(f"Error en **{f.name}**: {e}")
+                        for aviso in avisos_dup.get(card_id, []):
+                            st.warning(aviso)
+                        if nuevos:
+                            if (
+                                agregar_al_registry
+                                and persona_nombre not in registry.get(sel_type_key, [])
+                            ):
+                                registry.setdefault(sel_type_key, []).append(
+                                    persona_nombre
+                                )
+                                save_person_registry(registry)
+                            st.success(
+                                f"{nuevos} archivo(s) cargado(s) para **{persona_nombre}**."
+                            )
+                            st.rerun()
+                    elif uploaded and not persona_nombre:
+                        st.warning(
+                            "Ingresa el nombre de la persona antes de subir archivos."
+                        )
+
+                    # Archivos cargados de esta persona
+                    store = st.session_state.data[sel_type_key][ev_key]
+                    card_files = {
+                        fname: entry
+                        for fname, entry in store.items()
+                        if entry["meta"].get("_card_id") == card_id
+                    }
+                    if card_files:
+                        st.markdown(f"**Archivos ({len(card_files)})**")
+                        for fname, entry in list(card_files.items()):
+                            m = entry["meta"]
+                            persona_display = (
+                                m.get("persona_nombre") or m.get("docente") or "—"
+                            )
+                            with st.container():
+                                st.markdown(
+                                    f"**{persona_display}** — {m['modulo'] or fname}"
+                                )
+                                for adv in m.get("advertencias", []):
+                                    st.warning(adv)
+                                c1, c2, c3, c4, c5 = st.columns([2, 2, 2, 2, 1])
+                                new_modulo = c1.text_input(
+                                    "Módulo",
+                                    value=m["modulo"],
+                                    key=f"mod_{sel_type_key}_{ev_key}_{card_id}_{fname}",
+                                )
+                                new_grupo = c2.text_input(
+                                    "Grupo",
+                                    value=m["grupo"],
+                                    key=f"grp_{sel_type_key}_{ev_key}_{card_id}_{fname}",
+                                )
+                                new_carrera = c3.text_input(
+                                    "Carrera",
+                                    value=m["carrera"],
+                                    key=f"car_{sel_type_key}_{ev_key}_{card_id}_{fname}",
+                                )
+                                new_sede = c4.text_input(
+                                    "Sede",
+                                    value=m["sede"],
+                                    key=f"sede_{sel_type_key}_{ev_key}_{card_id}_{fname}",
+                                )
+                                new_persona = c5.text_input(
+                                    "Persona",
+                                    value=persona_display,
+                                    key=f"pers_{sel_type_key}_{ev_key}_{card_id}_{fname}",
+                                )
+                                c1, c2, c3 = st.columns([1, 1, 6])
+                                if c1.button(
+                                    "Guardar",
+                                    key=f"save_{sel_type_key}_{ev_key}_{card_id}_{fname}",
+                                ):
+                                    entry["meta"]["modulo"] = new_modulo
+                                    entry["meta"]["grupo"] = new_grupo
+                                    entry["meta"]["carrera"] = new_carrera
+                                    entry["meta"]["sede"] = new_sede
+                                    entry["meta"]["persona_nombre"] = new_persona
+                                    entry["meta"]["docente"] = new_persona
+                                    if new_persona and new_persona not in registry.get(
+                                        sel_type_key, []
+                                    ):
+                                        registry.setdefault(sel_type_key, []).append(
+                                            new_persona
+                                        )
+                                        save_person_registry(registry)
+                                    st.rerun()
+                                c2.caption(
+                                    f"{m['respuestas']} resp. | {m['fecha_inicio']} – {m['fecha_fin']}"
+                                )
+                                if c3.button(
+                                    "Borrar",
+                                    key=f"del_{sel_type_key}_{ev_key}_{card_id}_{fname}",
+                                ):
+                                    del st.session_state.data[sel_type_key][ev_key][
+                                        fname
+                                    ]
+                                    st.rerun()
+
+            # Botón para agregar otra persona
+            if st.button(
+                ":material/person_add: Agregar otra persona",
+                key=f"add_card_{sel_type_key}_{ev_key}",
+            ):
+                add_person_card(sel_type_key, ev_key)
+                st.rerun()
 
     # Acciones globales por tipo
     st.markdown("---")
@@ -1467,6 +1945,7 @@ if page == "Cargar Datos":
     if colB.button(f"Limpiar todo {sel_config['label']}", type="secondary"):
         for ev_key in sel_config["evaluators"]:
             st.session_state.data[sel_type_key][ev_key] = {}
+        st.session_state.person_cards = {}
         st.rerun()
 
 # ══════════════════════════════════════════════════════════

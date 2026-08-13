@@ -2,3 +2,4 @@ nul
 *.tmp
 __pycache__/
 venv/
+tests/datos/
